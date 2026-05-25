@@ -1,0 +1,145 @@
+DownloadManager.hpp
+
+
+
+#pragma once
+#include "FileDownload.hpp"
+#include <semaphore>
+#include <mutex>
+#include <queue>
+
+class DownloadManager {
+private:
+    std::queue<FileChunk> queue;
+    std::counting_semaphore<> active_downloads;
+    std::counting_semaphore<> chunk_downloads;
+    std::mutex mtx;
+    std::atomic<int> completed_files{0};
+    std::vector<FileDownload> tracked_files;
+
+public:
+    DownloadManager(int max_files, int max_chunks) : active_downloads(max_files), chunk_downloads(max_chunks) {}
+
+    void add_file(FileDownload file) {
+        std::lock_guard<std::mutex> lock(mtx);
+        tracked_files.push_back(file);
+
+        for (auto& chunk : tracked_files.back().chunks) {
+            queue.push(chunk);
+        }
+    }
+
+    void worker() {
+        auto thread_id = std::this_thread::get_id();
+        while (true) {
+            FileChunk chunk;
+            {
+                std::lock_guard<std::mutex> lock(mtx);
+                if (queue.empty()) {
+                    break;
+                }
+                chunk = queue.front();
+                queue.pop();
+            }
+
+            active_downloads.acquire();
+            chunk_downloads.acquire();
+
+            process_chunk(chunk, thread_id);
+        }
+    }
+
+    inline void process_chunk(FileChunk chunk, std::thread::id thread_id) {
+        std::cout << "Thread " << thread_id << " is downloading chunk " << chunk.chunk_id << " of file " << chunk.file_id << std::endl;
+        chunk.download();
+
+        for (auto& f : tracked_files) {
+            if (f.file_id == chunk.file_id) {
+                f.mark_chunk_downloaded();
+                if (f.is_complete()) {
+                    completed_files.fetch_add(1);
+                    std::cout << "File " << f.file_id << " download complete! Total completed: " << completed_files.load() << std::endl;
+                }
+                break;
+            }
+        }
+    }
+
+    int get_completed_files() const {
+        return completed_files.load();
+    }
+};
+
+
+
+FileChunk.hpp
+
+
+#pragma once
+#include <iostream>
+#include <thread>
+#include <chrono>
+
+class FileChunk {
+public:
+    int file_id;
+    size_t chunk_id;
+    size_t size;
+    void download() {
+        std::this_thread::sleep_for(std::chrono::milliseconds(200));
+    }
+};
+
+
+
+
+FileDownload.hpp
+
+#pragma once
+#include "FileChunk.hpp"
+#include <vector>
+#include <atomic>
+
+class FileDownload {
+public:
+    int file_id;
+    std::vector<FileChunk> chunks;
+    std::atomic<int> downloaded_chunks{0};
+    int total_chunks;
+
+    FileDownload(int id, int num_chunks) : file_id(id), total_chunks(num_chunks) {
+        for (int i = 0; i < num_chunks; ++i) {
+            chunks.push_back({id, static_cast<size_t>(i), 1024});
+        }
+    }
+
+    bool is_complete() {
+        return downloaded_chunks.load() == total_chunks;
+    }
+
+    void mark_chunk_downloaded() {
+        downloaded_chunks.fetch_add(1);
+    }
+};
+
+
+main.cpp
+
+#include "DownloadManager.hpp"
+
+int main() {
+    DownloadManager manager(1, 2);
+
+    manager.add_file(FileDownload(101, 3));
+    manager.add_file(FileDownload(102, 2));
+
+    std::thread t1(&DownloadManager::worker, &manager);
+    std::thread t2(&DownloadManager::worker, &manager);
+    std::thread t3(&DownloadManager::worker, &manager);
+
+    t1.detach(), t2.detach(), t3.detach();
+
+    std::this_thread::sleep_for(std::chrono::seconds(1));
+    std::cout << "Main thread is adding another file to download." << std::endl;
+    return 0;
+}
